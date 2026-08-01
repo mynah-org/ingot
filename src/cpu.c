@@ -7,10 +7,22 @@
  * forget — and the "runtime" half is checked on every platform.
  *
  * SPDX-License-Identifier: MIT */
+/* posix_memalign, below. glibc hides it under -std=c11 without this, and an
+ * implicitly declared function is an error on current compilers and undefined
+ * behaviour on the ones that let it through. macOS declares it either way,
+ * which is why only Linux ever complained. */
+#define _POSIX_C_SOURCE 200809L
+#if defined(__APPLE__)
+/* And <sys/sysctl.h> is outside the strict POSIX namespace on Darwin, so the
+ * line above alone breaks the SDK headers. Same pair as in safetensors.c. */
+#define _DARWIN_C_SOURCE 1
+#endif
+
 #include "ingot/quant.h"
 #include "internal.h"
 
 #include <pthread.h>
+#include <stdlib.h>
 
 #if defined(__APPLE__)
 #include <sys/sysctl.h>
