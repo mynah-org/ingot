@@ -1651,13 +1651,23 @@ static int ingot_q5_k_matvec_neon(const void *weights, size_t rows, size_t cols,
 }
 #endif
 
+static int kquant_apply(const void *weights, size_t rows, size_t cols,
+                        const float *input, float *output, size_t block_bytes,
+                        void (*dequant)(const unsigned char *, float *), int matvec);
+
 int ingot_q5_k_matvec(const void *weights, size_t rows, size_t cols,
                            const float *input, float *output) {
     if (!qk_args_ok(weights, input, output, rows, cols, INGOT_QK_K)) return -1;
 #if defined(INGOT_HAVE_Q4_K_NEON)
-    ingot_cpu_caps caps = ingot_cpu();
-    if (caps.neon)
+    if (ingot_cpu().neon)
         return ingot_q5_k_matvec_neon(weights, rows, cols, input, output);
+#endif
+#if defined(INGOT_HAVE_Q4_K_AVX2)
+    /* No dedicated AVX2 kernel (yet): decode-then-dot through kquant_apply
+     * still beats the scalar walk, since both halves of it are vectorized. */
+    if (ingot_cpu().avx2)
+        return kquant_apply(weights, rows, cols, input, output,
+                            INGOT_Q5_K_BYTES, q5_dequant_block, 1);
 #endif
     return ingot_q5_k_matvec_scalar(weights, rows, cols, input, output);
 }
@@ -1751,6 +1761,72 @@ static void q2_dequant_block(const unsigned char *block, float *output) {
 
 typedef void (*kquant_dequant_fn)(const unsigned char *, float *);
 
+/* ── the decode-then-dot inner product ──────────────────────────────────────
+ * Four accumulators: enough to hide FMA latency on both ISAs, and a reordered
+ * sum is within the 1e-5 budget the parity test grants the exact path. The
+ * compiler cannot do this on its own — reordering float sums needs
+ * -ffast-math, which this library does not build with. */
+typedef float (*qk_dot_fn)(const float *, const float *, size_t);
+
+static float qk_dot_scalar(const float *a, const float *b, size_t n) {
+    float sum = 0.0f;
+    for (size_t i = 0; i < n; i++) sum += a[i] * b[i];
+    return sum;
+}
+
+#if defined(INGOT_HAVE_Q4_K_NEON)
+static float qk_dot_neon(const float *a, const float *b, size_t n) {
+    float32x4_t acc0 = vdupq_n_f32(0.0f), acc1 = vdupq_n_f32(0.0f);
+    float32x4_t acc2 = vdupq_n_f32(0.0f), acc3 = vdupq_n_f32(0.0f);
+    size_t i = 0;
+    for (; i + 16 <= n; i += 16) {
+        acc0 = vfmaq_f32(acc0, vld1q_f32(a + i),      vld1q_f32(b + i));
+        acc1 = vfmaq_f32(acc1, vld1q_f32(a + i + 4),  vld1q_f32(b + i + 4));
+        acc2 = vfmaq_f32(acc2, vld1q_f32(a + i + 8),  vld1q_f32(b + i + 8));
+        acc3 = vfmaq_f32(acc3, vld1q_f32(a + i + 12), vld1q_f32(b + i + 12));
+    }
+    float sum = vaddvq_f32(vaddq_f32(vaddq_f32(acc0, acc1),
+                                     vaddq_f32(acc2, acc3)));
+    for (; i < n; i++) sum += a[i] * b[i];
+    return sum;
+}
+#endif
+
+#if defined(INGOT_HAVE_Q4_K_AVX2)
+static float qk_dot_avx2(const float *a, const float *b, size_t n) {
+    __m256 acc0 = _mm256_setzero_ps(), acc1 = _mm256_setzero_ps();
+    __m256 acc2 = _mm256_setzero_ps(), acc3 = _mm256_setzero_ps();
+    size_t i = 0;
+    for (; i + 32 <= n; i += 32) {
+        acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i),      _mm256_loadu_ps(b + i),      acc0);
+        acc1 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i + 8),  _mm256_loadu_ps(b + i + 8),  acc1);
+        acc2 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i + 16), _mm256_loadu_ps(b + i + 16), acc2);
+        acc3 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i + 24), _mm256_loadu_ps(b + i + 24), acc3);
+    }
+    const __m256 acc = _mm256_add_ps(_mm256_add_ps(acc0, acc1),
+                                     _mm256_add_ps(acc2, acc3));
+    __m128 s = _mm_add_ps(_mm256_castps256_ps128(acc),
+                          _mm256_extractf128_ps(acc, 1));
+    s = _mm_add_ps(s, _mm_movehl_ps(s, s));
+    s = _mm_add_ss(s, _mm_movehdup_ps(s));
+    float sum = _mm_cvtss_f32(s);
+    for (; i < n; i++) sum += a[i] * b[i];
+    return sum;
+}
+#endif
+
+static qk_dot_fn qk_dot_pick(void) {
+    const ingot_cpu_caps caps = ingot_cpu();
+    (void)caps;
+#if defined(INGOT_HAVE_Q4_K_NEON)
+    if (caps.neon) return qk_dot_neon;
+#endif
+#if defined(INGOT_HAVE_Q4_K_AVX2)
+    if (caps.avx2) return qk_dot_avx2;
+#endif
+    return qk_dot_scalar;
+}
+
 static int kquant_apply(const void *weights, size_t rows, size_t cols,
                         const float *input, float *output, size_t block_bytes,
                         kquant_dequant_fn dequant, int matvec) {
@@ -1761,6 +1837,7 @@ static int kquant_apply(const void *weights, size_t rows, size_t cols,
     size_t row_bytes = blocks_per_row * block_bytes;
     if (rows > SIZE_MAX / row_bytes || rows * cols > SIZE_MAX / sizeof(float)) return -1;
     const unsigned char *source = (const unsigned char *)weights;
+    const qk_dot_fn dot = qk_dot_pick();
     float values[INGOT_QK_K];
     for (size_t row = 0; row < rows; row++) {
         const unsigned char *row_data = source + row * row_bytes;
@@ -1768,8 +1845,7 @@ static int kquant_apply(const void *weights, size_t rows, size_t cols,
             float sum = 0.0f;
             for (size_t block = 0; block < blocks_per_row; block++) {
                 dequant(row_data + block * block_bytes, values);
-                const float *x = input + block * INGOT_QK_K;
-                for (size_t i = 0; i < INGOT_QK_K; i++) sum += values[i] * x[i];
+                sum += dot(values, input + block * INGOT_QK_K, INGOT_QK_K);
             }
             output[row] = sum;
         } else {
@@ -1896,15 +1972,14 @@ static int ingot_q8_0_matvec_s(const void *weights, size_t rows, size_t cols,
     size_t row_bytes = blocks * INGOT_Q8_0_BYTES;
     if (rows > SIZE_MAX / row_bytes) return -1;
     const unsigned char *source = (const unsigned char *)weights;
+    const qk_dot_fn dot = qk_dot_pick();
+    float values[INGOT_Q8_0_K];
     for (size_t row = 0; row < rows; row++) {
         const unsigned char *row_data = source + row * row_bytes;
         float sum = 0.0f;
         for (size_t b = 0; b < blocks; b++) {
-            const unsigned char *block = row_data + b * INGOT_Q8_0_BYTES;
-            float d = f16_to_f32(read_u16(block));
-            const signed char *qs = (const signed char *)(block + 2);
-            for (int i = 0; i < INGOT_Q8_0_K; i++)
-                sum += (float)qs[i] * d * input[b * INGOT_Q8_0_K + i];
+            q8_0_dequant_block(row_data + b * INGOT_Q8_0_BYTES, values);
+            sum += dot(values, input + b * INGOT_Q8_0_K, INGOT_Q8_0_K);
         }
         output[row] = sum;
     }
