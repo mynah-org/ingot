@@ -4,6 +4,33 @@ A zero-dependency C11 library for reading and writing **GGUF** and
 **safetensors** — the two weight containers used by llama.cpp and the
 Hugging Face ecosystem. One static library or a two-file amalgam. MIT.
 
+## Features
+
+- **GGUF v2/v3**: typed metadata KV store (scalars, arrays, vocabularies),
+  split files (`-00001-of-00003.gguf`), zero-copy `mmap` plus a `pread` path
+  for platforms where mapping is not an option.
+- **safetensors**: single file, sharded directory
+  (`model.safetensors.index.json`, with glob fallback) or an explicit shard
+  list; `__metadata__` exposed; `F32/F16/BF16/F8_E4M3/F8_E5M2/I8..I64/U8..U64/BOOL`.
+- **All 33 ggml quantized block types decode** — the K-quants, the full
+  `IQ1`–`IQ4` codebook family, ternary `TQ`, microscaling `MXFP4`/`NVFP4` —
+  verified bit-for-bit against llama.cpp. See [docs/QUANTS.md](docs/QUANTS.md).
+- **SIMD kernels**: matvec and batched matmat for
+  `Q2_K Q3_K Q4_K Q5_K Q6_K Q8_0`, with NEON, AVX2, ARM SDOT and ARM SMMLA
+  paths selected at runtime. `ingot_matvec(type, …)` / `ingot_matmat(…)` use
+  the specialized kernel when one exists and decode row-by-row otherwise, so
+  callers never branch on the format.
+- **Writers** for both containers, including quantize-on-write: hand in f32
+  and a target type (`F16 BF16 F32 Q4_0 Q4_1 Q5_0 Q5_1 Q8_0 Q4_K Q6_K`).
+- **Page-cache control**: `prefault`, `dontneed`, `drop_cache` for large
+  checkpoints on shared/unified memory.
+- **O(1) lookup** over tensor names and metadata keys (FNV-1a index).
+- **Predictable behavior**: errors come back as strings and nothing is ever
+  written to stderr; quantized tensors are returned as stored — dequantization
+  is an explicit call; no hidden allocations; malformed or unknown input fails
+  with a precise message (`IQ4_XS` rather than `unknown type 23`), never a
+  silent truncation.
+
 ## Quick start
 
 ```c
@@ -33,32 +60,36 @@ const uint16_t *bf16 = ingot_st_data(st, e);
 `examples/minimal.c` shows the full flow in 80 lines: open either format,
 find a tensor, multiply a vector through it regardless of its quantization.
 
-## Features
+## Using it in your project
 
-- **GGUF v2/v3**: typed metadata KV store (scalars, arrays, vocabularies),
-  split files (`-00001-of-00003.gguf`), zero-copy `mmap` plus a `pread` path
-  for platforms where mapping is not an option.
-- **safetensors**: single file, sharded directory
-  (`model.safetensors.index.json`, with glob fallback) or an explicit shard
-  list; `__metadata__` exposed; `F32/F16/BF16/F8_E4M3/F8_E5M2/I8..I64/U8..U64/BOOL`.
-- **All 33 ggml quantized block types decode** — the K-quants, the full
-  `IQ1`–`IQ4` codebook family, ternary `TQ`, microscaling `MXFP4`/`NVFP4` —
-  verified bit-for-bit against llama.cpp. See [docs/QUANTS.md](docs/QUANTS.md).
-- **SIMD kernels**: matvec and batched matmat for
-  `Q2_K Q3_K Q4_K Q5_K Q6_K Q8_0`, with NEON, AVX2, ARM SDOT and ARM SMMLA
-  paths selected at runtime. `ingot_matvec(type, …)` / `ingot_matmat(…)` use
-  the specialized kernel when one exists and decode row-by-row otherwise, so
-  callers never branch on the format.
-- **Writers** for both containers, including quantize-on-write: hand in f32
-  and a target type (`F16 BF16 F32 Q4_0 Q4_1 Q5_0 Q5_1 Q8_0 Q4_K Q6_K`).
-- **Page-cache control**: `prefault`, `dontneed`, `drop_cache` for large
-  checkpoints on shared/unified memory.
-- **O(1) lookup** over tensor names and metadata keys (FNV-1a index).
-- **Predictable behavior**: errors come back as strings and nothing is ever
-  written to stderr; quantized tensors are returned as stored — dequantization
-  is an explicit call; no hidden allocations; malformed or unknown input fails
-  with a precise message (`IQ4_XS` rather than `unknown type 23`), never a
-  silent truncation.
+Build the static library once and link it — no build system, no configure:
+
+```sh
+make -C ingot lib
+cc -std=c11 -O2 -Iingot/include app.c ingot/libingot.a -lpthread -lm
+```
+
+Or copy the **two-file amalgam** in and compile the `.c` like any other
+source — zero build integration:
+
+```sh
+cp ingot/amalgam/ingot.h ingot/amalgam/ingot.c yourproject/vendor/
+cc -std=c11 -O2 yourproject/vendor/ingot.c ... -lpthread -lm
+```
+
+Good to know:
+
+- Requirements are just C11, POSIX and `-lpthread -lm`; the header also
+  parses as C++.
+- `-DINGOT_NO_KERNELS` drops the quantization half (141 KB → 70 KB of object
+  code) for tools that only read containers.
+- Only the container half is mandatory (`dtype.c`, `gguf.c`,
+  `safetensors.c`, `wfile.c`, `write.c`); `cpu.c`, `dequant.c`, `kernels.c`,
+  `generic.c` and `quantize.c` are optional. `cc -Iinclude -c src/*.c` works
+  if you want no Makefile at all.
+- Vendoring the whole repo (e.g. as a `git subtree` under `third_party/`)
+  works well too: have your Makefile run `make -C third_party/ingot lib` and
+  link the result.
 
 ## Documentation
 
@@ -74,7 +105,7 @@ find a tensor, multiply a vector through it regardless of its quantization.
 
 The headers are the reference: each one documents its API and its limits.
 
-## Build
+## Build & test
 
 ```sh
 make                # libingot.a, ingot-dump, examples
@@ -82,30 +113,10 @@ make test           # full suite, no model files and no Python needed
 make help           # every target, one line each
 ```
 
-Requirements: a C11 compiler, POSIX, `-lpthread -lm`. No build system needed —
-`cc -Iinclude -c src/*.c` works too.
-
-Only the container half is mandatory (`dtype.c`, `gguf.c`, `safetensors.c`,
-`wfile.c`, `write.c`); the quantization half (`cpu.c`, `dequant.c`,
-`kernels.c`, `generic.c`, `quantize.c`) is optional for tools that only
-inspect files. `make core-only` builds and verifies that split.
-
-### Single-file amalgam
-
-To vendor ingot without any build integration, copy two files and compile the
-`.c` like any other source:
-
-```sh
-cp ingot/amalgam/ingot.h ingot/amalgam/ingot.c yourproject/vendor/
-cc -std=c11 -O2 yourproject/vendor/ingot.c ... -lpthread -lm
-```
-
-`amalgam/` is generated from `src/` by `make amalgam`, and `make amalgam-test`
-runs the entire test suite against the generated pair. The header also parses
-as C++. Define `-DINGOT_NO_KERNELS` to drop the quantization half
-(141 KB → 70 KB of object code).
-
-### Other targets
+`make core-only` builds the readers without the quantization half and proves
+the split on every commit. `amalgam/` is generated from `src/` by
+`make amalgam`, and `make amalgam-test` runs the entire suite against the
+generated pair.
 
 | target | |
 |---|---|
