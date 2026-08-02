@@ -27,7 +27,10 @@ typedef ingot_range_fn ingot_range_fn_t;
 #define INGOT_HAVE_Q4_K_NEON 1
 #endif
 
-#if defined(__AVX2__) && !defined(INGOT_DISABLE_AVX2)
+/* The AVX2 kernels lean on FMA, and -mavx2 alone does not imply -mfma: guard
+ * on both, or a plain -mavx2 build dies on an always_inline mismatch. Every
+ * AVX2 CPU since Haswell has FMA, so the pair costs nothing in practice. */
+#if defined(__AVX2__) && defined(__FMA__) && !defined(INGOT_DISABLE_AVX2)
 #include <immintrin.h>
 #define INGOT_HAVE_Q4_K_AVX2 1
 #endif

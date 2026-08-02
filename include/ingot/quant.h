@@ -41,6 +41,8 @@ int ingot_gguf_dequant(const ingot_gguf *g, const ingot_tensor *t, float *dst);
 typedef struct {
     int neon, dotprod, i8mm;      /* ARM: compiled AND present at runtime */
     int avx2, avx512, avx512_vnni;/* x86: same                            */
+    int bf16;                     /* ARM FEAT_BF16 (BFDOT/BFMMLA)         */
+    int f16c, avx512_bf16;        /* x86: VCVTPH2PS / VDPBF16PS           */
 } ingot_cpu_caps;
 
 ingot_cpu_caps ingot_cpu(void);
