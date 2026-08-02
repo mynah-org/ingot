@@ -16,10 +16,16 @@ Hugging Face ecosystem. One static library or a two-file amalgam. MIT.
   `IQ1`–`IQ4` codebook family, ternary `TQ`, microscaling `MXFP4`/`NVFP4` —
   verified bit-for-bit against llama.cpp. See [docs/QUANTS.md](docs/QUANTS.md).
 - **SIMD kernels**: matvec and batched matmat for
-  `Q2_K Q3_K Q4_K Q5_K Q6_K Q8_0`, with NEON, AVX2, ARM SDOT and ARM SMMLA
-  paths selected at runtime. `ingot_matvec(type, …)` / `ingot_matmat(…)` use
-  the specialized kernel when one exists and decode row-by-row otherwise, so
+  `Q2_K Q3_K Q4_K Q5_K Q6_K Q8_0`, with NEON, AVX2, ARM SDOT/SMMLA and
+  AVX-512 VNNI paths selected at runtime; dense **BF16/F16** matvec/matmat
+  multiply straight through the stored bytes (widen in-register, no f32
+  conversion pass). `ingot_matvec(type, …)` / `ingot_matmat(…)` use the
+  specialized kernel when one exists and decode row-by-row otherwise, so
   callers never branch on the format.
+- **Fast loads**: BF16/F16→F32 bulk conversion and the hot dequants
+  (`Q4_K Q5_K Q6_K Q8_0`) are vectorized on NEON, AVX2 and AVX-512 —
+  dequant-at-load engines stop walking a 20 GB checkpoint one element at a
+  time.
 - **Writers** for both containers, including quantize-on-write: hand in f32
   and a target type (`F16 BF16 F32 Q4_0 Q4_1 Q5_0 Q5_1 Q8_0 Q4_K Q6_K`).
 - **Page-cache control**: `prefault`, `dontneed`, `drop_cache` for large
