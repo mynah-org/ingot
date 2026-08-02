@@ -299,10 +299,10 @@ int ingot_dequant(int type, const void *src, size_t nelem, float *dst) {
     switch (type) {
     case INGOT_TYPE_F32:  memcpy(dst, src, nelem * sizeof(float)); return 0;
     case INGOT_TYPE_F16:
-        for (size_t i = 0; i < nelem; i++) dst[i] = ingot_f16_to_f32(ingot_ld_u16(p + 2 * i));
+        ingot_f16_block_to_f32(p, nelem, dst);
         return 0;
     case INGOT_TYPE_BF16:
-        for (size_t i = 0; i < nelem; i++) dst[i] = ingot_bf16_to_f32(ingot_ld_u16(p + 2 * i));
+        ingot_bf16_block_to_f32(p, nelem, dst);
         return 0;
     case INGOT_TYPE_F64:
         for (size_t i = 0; i < nelem; i++) {

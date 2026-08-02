@@ -21,7 +21,7 @@ CORE_OBJ   = $(CORE_SRC:.c=.o)
 
 LIB      = libingot.a
 TESTS    = build/test_gguf build/test_safetensors build/test_quant build/test_formats \
-           build/test_oracle build/test_wfile build/test_write
+           build/test_oracle build/test_wfile build/test_write build/test_convert
 TOOLS    = build/ingot-dump
 
 .PHONY: all lib tools test clean core-only help
