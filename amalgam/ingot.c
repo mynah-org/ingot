@@ -8879,6 +8879,288 @@ int ingot_q8_0_matmat(const void *weights, size_t rows, size_t cols,
                      q8_0_decode_super);
 }
 
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Dense F16 / BF16 — the weights exactly as stored, no conversion pass
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ * The alternative these kernels remove is the load-time f32 blow-up: a BF16
+ * checkpoint converted on open doubles its footprint before the first token.
+ * Multiplying THROUGH the stored bytes keeps the mapping zero-copy and reads
+ * half the memory per dot, which is what a bandwidth-bound matvec actually
+ * pays for. Widening BF16 (a 16-bit shift) and F16 (FCVTL / VCVTPH2PS) is
+ * exact, so the result is ordinary f32 arithmetic on the stored values — a
+ * reordered sum, never an approximation.
+ *
+ * Batched form: four tokens share every widened weight vector, so the widen
+ * cost is divided by the register tile the way the quantized GEMM divides its
+ * decode cost. No BFDOT/BFMMLA here yet: both need the ACTIVATIONS truncated
+ * to bf16 too, which is a precision decision the consumer should opt into,
+ * not inherit — it goes in with a bench when a machine with FEAT_BF16 is on
+ * the desk. */
+
+static inline float dense_at(const unsigned char *p, int f16) {
+    const uint16_t v = (uint16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8));
+    return f16 ? ingot_f16_to_f32(v) : ingot_bf16_to_f32(v);
+}
+
+typedef struct {
+    const unsigned char *w;
+    const float *input;          /* [tokens][cols] row-major */
+    float *output;               /* [tokens][rows] row-major */
+    size_t rows, cols, tokens;
+    int f16;
+} dense_job_t;
+
+static void dense_rows(size_t begin, size_t end, void *user) {
+    const dense_job_t *job = user;
+    const size_t cols = job->cols, tokens = job->tokens;
+    const int f16 = job->f16;
+
+#if defined(INGOT_HAVE_Q4_K_NEON) && defined(__aarch64__)
+    if (ingot_cpu().neon) {
+        for (size_t row = begin; row < end; row++) {
+            const unsigned char *wrow = job->w + row * cols * 2;
+            size_t t = 0;
+            for (; t + 4 <= tokens; t += 4) {
+                const float *x0 = job->input + t * cols;
+                const float *x1 = x0 + cols, *x2 = x1 + cols, *x3 = x2 + cols;
+                float32x4_t a0 = vdupq_n_f32(0.0f), a1 = a0, a2 = a0, a3 = a0;
+                size_t c = 0;
+                for (; c + 8 <= cols; c += 8) {
+                    float32x4_t wlo, whi;
+                    if (f16) {
+                        const float16x8_t h = vld1q_f16(
+                            (const float16_t *)(const void *)(wrow + 2 * c));
+                        wlo = vcvt_f32_f16(vget_low_f16(h));
+                        whi = vcvt_f32_f16(vget_high_f16(h));
+                    } else {
+                        const uint16x8_t h = vld1q_u16(
+                            (const uint16_t *)(const void *)(wrow + 2 * c));
+                        wlo = vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(h), 16));
+                        whi = vreinterpretq_f32_u32(vshll_n_u16(vget_high_u16(h), 16));
+                    }
+                    a0 = vfmaq_f32(a0, wlo, vld1q_f32(x0 + c));
+                    a0 = vfmaq_f32(a0, whi, vld1q_f32(x0 + c + 4));
+                    a1 = vfmaq_f32(a1, wlo, vld1q_f32(x1 + c));
+                    a1 = vfmaq_f32(a1, whi, vld1q_f32(x1 + c + 4));
+                    a2 = vfmaq_f32(a2, wlo, vld1q_f32(x2 + c));
+                    a2 = vfmaq_f32(a2, whi, vld1q_f32(x2 + c + 4));
+                    a3 = vfmaq_f32(a3, wlo, vld1q_f32(x3 + c));
+                    a3 = vfmaq_f32(a3, whi, vld1q_f32(x3 + c + 4));
+                }
+                float s0 = vaddvq_f32(a0), s1 = vaddvq_f32(a1);
+                float s2 = vaddvq_f32(a2), s3 = vaddvq_f32(a3);
+                for (; c < cols; c++) {
+                    const float wv = dense_at(wrow + 2 * c, f16);
+                    s0 += wv * x0[c]; s1 += wv * x1[c];
+                    s2 += wv * x2[c]; s3 += wv * x3[c];
+                }
+                job->output[(t + 0) * job->rows + row] = s0;
+                job->output[(t + 1) * job->rows + row] = s1;
+                job->output[(t + 2) * job->rows + row] = s2;
+                job->output[(t + 3) * job->rows + row] = s3;
+            }
+            for (; t < tokens; t++) {
+                const float *x = job->input + t * cols;
+                float32x4_t a0 = vdupq_n_f32(0.0f), a1 = vdupq_n_f32(0.0f);
+                size_t c = 0;
+                for (; c + 8 <= cols; c += 8) {
+                    float32x4_t wlo, whi;
+                    if (f16) {
+                        const float16x8_t h = vld1q_f16(
+                            (const float16_t *)(const void *)(wrow + 2 * c));
+                        wlo = vcvt_f32_f16(vget_low_f16(h));
+                        whi = vcvt_f32_f16(vget_high_f16(h));
+                    } else {
+                        const uint16x8_t h = vld1q_u16(
+                            (const uint16_t *)(const void *)(wrow + 2 * c));
+                        wlo = vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(h), 16));
+                        whi = vreinterpretq_f32_u32(vshll_n_u16(vget_high_u16(h), 16));
+                    }
+                    a0 = vfmaq_f32(a0, wlo, vld1q_f32(x + c));
+                    a1 = vfmaq_f32(a1, whi, vld1q_f32(x + c + 4));
+                }
+                float s = vaddvq_f32(vaddq_f32(a0, a1));
+                for (; c < cols; c++) s += dense_at(wrow + 2 * c, f16) * x[c];
+                job->output[t * job->rows + row] = s;
+            }
+        }
+        return;
+    }
+#endif
+
+#if defined(INGOT_HAVE_Q4_K_AVX2)
+    {
+        int simd = ingot_cpu().avx2;
+#if defined(__F16C__)
+        if (f16 && !ingot_cpu().f16c) simd = 0;
+#else
+        if (f16) simd = 0;
+#endif
+        if (simd) {
+            for (size_t row = begin; row < end; row++) {
+                const unsigned char *wrow = job->w + row * cols * 2;
+                size_t t = 0;
+                for (; t + 4 <= tokens; t += 4) {
+                    const float *x0 = job->input + t * cols;
+                    const float *x1 = x0 + cols, *x2 = x1 + cols, *x3 = x2 + cols;
+                    __m256 a0 = _mm256_setzero_ps(), a1 = a0, a2 = a0, a3 = a0;
+                    size_t c = 0;
+                    for (; c + 8 <= cols; c += 8) {
+                        const __m128i h = _mm_loadu_si128(
+                            (const __m128i *)(wrow + 2 * c));
+                        __m256 w8;
+#if defined(__F16C__)
+                        if (f16) w8 = _mm256_cvtph_ps(h); else
+#endif
+                        w8 = _mm256_castsi256_ps(_mm256_slli_epi32(
+                                 _mm256_cvtepu16_epi32(h), 16));
+                        a0 = _mm256_fmadd_ps(w8, _mm256_loadu_ps(x0 + c), a0);
+                        a1 = _mm256_fmadd_ps(w8, _mm256_loadu_ps(x1 + c), a1);
+                        a2 = _mm256_fmadd_ps(w8, _mm256_loadu_ps(x2 + c), a2);
+                        a3 = _mm256_fmadd_ps(w8, _mm256_loadu_ps(x3 + c), a3);
+                    }
+                    float s0, s1, s2, s3;
+                    {
+                        __m128 r0 = _mm_add_ps(_mm256_castps256_ps128(a0),
+                                               _mm256_extractf128_ps(a0, 1));
+                        __m128 r1 = _mm_add_ps(_mm256_castps256_ps128(a1),
+                                               _mm256_extractf128_ps(a1, 1));
+                        __m128 r2 = _mm_add_ps(_mm256_castps256_ps128(a2),
+                                               _mm256_extractf128_ps(a2, 1));
+                        __m128 r3 = _mm_add_ps(_mm256_castps256_ps128(a3),
+                                               _mm256_extractf128_ps(a3, 1));
+                        r0 = _mm_add_ps(r0, _mm_movehl_ps(r0, r0));
+                        r1 = _mm_add_ps(r1, _mm_movehl_ps(r1, r1));
+                        r2 = _mm_add_ps(r2, _mm_movehl_ps(r2, r2));
+                        r3 = _mm_add_ps(r3, _mm_movehl_ps(r3, r3));
+                        s0 = _mm_cvtss_f32(_mm_add_ss(r0, _mm_movehdup_ps(r0)));
+                        s1 = _mm_cvtss_f32(_mm_add_ss(r1, _mm_movehdup_ps(r1)));
+                        s2 = _mm_cvtss_f32(_mm_add_ss(r2, _mm_movehdup_ps(r2)));
+                        s3 = _mm_cvtss_f32(_mm_add_ss(r3, _mm_movehdup_ps(r3)));
+                    }
+                    for (; c < cols; c++) {
+                        const float wv = dense_at(wrow + 2 * c, f16);
+                        s0 += wv * x0[c]; s1 += wv * x1[c];
+                        s2 += wv * x2[c]; s3 += wv * x3[c];
+                    }
+                    job->output[(t + 0) * job->rows + row] = s0;
+                    job->output[(t + 1) * job->rows + row] = s1;
+                    job->output[(t + 2) * job->rows + row] = s2;
+                    job->output[(t + 3) * job->rows + row] = s3;
+                }
+                for (; t < tokens; t++) {
+                    const float *x = job->input + t * cols;
+                    __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps();
+                    size_t c = 0;
+                    for (; c + 16 <= cols; c += 16) {
+                        const __m128i h0 = _mm_loadu_si128(
+                            (const __m128i *)(wrow + 2 * c));
+                        const __m128i h1 = _mm_loadu_si128(
+                            (const __m128i *)(wrow + 2 * c + 16));
+                        __m256 w0, w1;
+#if defined(__F16C__)
+                        if (f16) { w0 = _mm256_cvtph_ps(h0); w1 = _mm256_cvtph_ps(h1); } else
+#endif
+                        {
+                            w0 = _mm256_castsi256_ps(_mm256_slli_epi32(
+                                     _mm256_cvtepu16_epi32(h0), 16));
+                            w1 = _mm256_castsi256_ps(_mm256_slli_epi32(
+                                     _mm256_cvtepu16_epi32(h1), 16));
+                        }
+                        a0 = _mm256_fmadd_ps(w0, _mm256_loadu_ps(x + c), a0);
+                        a1 = _mm256_fmadd_ps(w1, _mm256_loadu_ps(x + c + 8), a1);
+                    }
+                    const __m256 acc = _mm256_add_ps(a0, a1);
+                    __m128 r = _mm_add_ps(_mm256_castps256_ps128(acc),
+                                          _mm256_extractf128_ps(acc, 1));
+                    r = _mm_add_ps(r, _mm_movehl_ps(r, r));
+                    float s = _mm_cvtss_f32(_mm_add_ss(r, _mm_movehdup_ps(r)));
+                    for (; c < cols; c++) s += dense_at(wrow + 2 * c, f16) * x[c];
+                    job->output[t * job->rows + row] = s;
+                }
+            }
+            return;
+        }
+    }
+#endif
+
+    for (size_t row = begin; row < end; row++) {
+        const unsigned char *wrow = job->w + row * cols * 2;
+        for (size_t t = 0; t < tokens; t++) {
+            const float *x = job->input + t * cols;
+            float s = 0.0f;
+            for (size_t c = 0; c < cols; c++)
+                s += dense_at(wrow + 2 * c, f16) * x[c];
+            job->output[t * job->rows + row] = s;
+        }
+    }
+}
+
+static int dense_args_ok(const void *weights, const float *input, float *output,
+                         size_t rows, size_t cols, size_t tokens) {
+    if (weights == NULL || input == NULL || output == NULL ||
+        rows == 0 || cols == 0 || tokens == 0) return 0;
+    if (cols > SIZE_MAX / 2 || rows > SIZE_MAX / (cols * 2)) return 0;
+    if (tokens > SIZE_MAX / cols) return 0;
+    return 1;
+}
+
+static int dense_matvec(const void *weights, size_t rows, size_t cols,
+                        const float *input, float *output, int f16) {
+    if (!dense_args_ok(weights, input, output, rows, cols, 1)) return -1;
+    dense_job_t job = {(const unsigned char *)weights, input, output,
+                       rows, cols, 1, f16};
+    /* Serial on purpose, like every other matvec here: the consumer splits
+     * rows over its own pool, and a nested parallel_for into that same pool
+     * is a deadlock waiting for a schedule. */
+    dense_rows(0, rows, &job);
+    return 0;
+}
+
+static int dense_matmat(const void *weights, size_t rows, size_t cols,
+                        const float *input, float *output, size_t tokens,
+                        int f16) {
+    if (!dense_args_ok(weights, input, output, rows, cols, tokens)) return -1;
+    dense_job_t job = {(const unsigned char *)weights, input, output,
+                       rows, cols, tokens, f16};
+    ingot_parallel_for(rows, dense_rows, &job);
+    return 0;
+}
+
+int ingot_bf16_matvec(const void *weights, size_t rows, size_t cols,
+                      const float *input, float *output) {
+    return dense_matvec(weights, rows, cols, input, output, 0);
+}
+int ingot_bf16_matmat(const void *weights, size_t rows, size_t cols,
+                      const float *input, float *output, size_t tokens) {
+    return dense_matmat(weights, rows, cols, input, output, tokens, 0);
+}
+int ingot_f16_matvec(const void *weights, size_t rows, size_t cols,
+                     const float *input, float *output) {
+    return dense_matvec(weights, rows, cols, input, output, 1);
+}
+int ingot_f16_matmat(const void *weights, size_t rows, size_t cols,
+                     const float *input, float *output, size_t tokens) {
+    return dense_matmat(weights, rows, cols, input, output, tokens, 1);
+}
+
+/* The dequant twins ride the bulk converters from dtype.c. */
+int ingot_bf16_dequant(const void *weights, size_t rows, size_t cols,
+                       float *output) {
+    if (weights == NULL || output == NULL || rows == 0 || cols == 0) return -1;
+    if (cols > SIZE_MAX / 2 || rows > SIZE_MAX / (cols * 2)) return -1;
+    ingot_bf16_block_to_f32((const unsigned char *)weights, rows * cols, output);
+    return 0;
+}
+int ingot_f16_dequant(const void *weights, size_t rows, size_t cols,
+                      float *output) {
+    if (weights == NULL || output == NULL || rows == 0 || cols == 0) return -1;
+    if (cols > SIZE_MAX / 2 || rows > SIZE_MAX / (cols * 2)) return -1;
+    ingot_f16_block_to_f32((const unsigned char *)weights, rows * cols, output);
+    return 0;
+}
+
 /* ═══ src/generic.c ═══ */
 /* Type-generic entry points.
  *
@@ -8911,6 +9193,8 @@ static void specialized(int type, matvec_fn *mv, matmat_fn *mm, deqmat_fn *dq) {
     case INGOT_TYPE_Q5_K: *mv = ingot_q5_k_matvec; *mm = ingot_q5_k_matmat; *dq = ingot_q5_k_dequant; break;
     case INGOT_TYPE_Q6_K: *mv = ingot_q6_k_matvec; *mm = ingot_q6_k_matmat; *dq = ingot_q6_k_dequant; break;
     case INGOT_TYPE_Q8_0: *mv = ingot_q8_0_matvec; *mm = ingot_q8_0_matmat; *dq = ingot_q8_0_dequant; break;
+    case INGOT_TYPE_BF16: *mv = ingot_bf16_matvec; *mm = ingot_bf16_matmat; *dq = ingot_bf16_dequant; break;
+    case INGOT_TYPE_F16:  *mv = ingot_f16_matvec;  *mm = ingot_f16_matmat;  *dq = ingot_f16_dequant;  break;
     default: break;
     }
 }
