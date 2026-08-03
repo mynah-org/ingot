@@ -15,6 +15,7 @@
 #if defined(__APPLE__)
 #define _DARWIN_C_SOURCE 1
 #endif
+#define _POSIX_C_SOURCE 200809L   /* ftello/off_t under -std=c11 on glibc */
 
 #include "ingot.h"
 
@@ -2451,6 +2452,7 @@ ingot_st *ingot_wfile_st(const ingot_wfile *w) {
  * caller, not to a loader.
  *
  * SPDX-License-Identifier: MIT */
+#include <sys/types.h>
 
 #ifndef INGOT_NO_KERNELS
 #endif

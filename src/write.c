@@ -5,6 +5,8 @@
  * caller, not to a loader.
  *
  * SPDX-License-Identifier: MIT */
+#define _POSIX_C_SOURCE 200809L   /* ftello/off_t under -std=c11 on glibc */
+#include <sys/types.h>
 #include "ingot/write.h"
 #include "ingot/gguf.h"   /* the INGOT_KV_* tags */
 #include "internal.h"
