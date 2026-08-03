@@ -500,7 +500,9 @@ void ingot_bf16_block_to_f32(const unsigned char *p, size_t nelem, float *dst) {
     }
 #elif defined(INGOT_DTYPE_NEON)
     for (; i + 8 <= nelem; i += 8) {
-        const uint16x8_t h = vld1q_u16((const uint16_t *)(const void *)(p + 2 * i));
+        /* byte load: these converters accept any source alignment, and
+         * vld1q_u16 would promise the compiler 2-byte alignment it may not have */
+        const uint16x8_t h = vreinterpretq_u16_u8(vld1q_u8(p + 2 * i));
         vst1q_f32(dst + i,     vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(h), 16)));
         vst1q_f32(dst + i + 4, vreinterpretq_f32_u32(vshll_n_u16(vget_high_u16(h), 16)));
     }
@@ -521,7 +523,8 @@ void ingot_f16_block_to_f32(const unsigned char *p, size_t nelem, float *dst) {
             _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(p + 2 * i))));
 #elif defined(INGOT_DTYPE_NEON) && defined(__aarch64__)
     for (; i + 4 <= nelem; i += 4) {
-        const float16x4_t h = vld1_f16((const float16_t *)(const void *)(p + 2 * i));
+        /* byte load: any source alignment (see the BF16 twin above) */
+        const float16x4_t h = vreinterpret_f16_u8(vld1_u8(p + 2 * i));
         vst1q_f32(dst + i, vcvt_f32_f16(h));
     }
 #endif
@@ -574,7 +577,9 @@ void ingot_f32_block_to_bf16(const float *src, size_t nelem, unsigned char *dst)
             vcgtq_u32(vandq_u32(bits, manm), vdupq_n_u32(0)));
         const uint16x4_t nanh = vorr_u16(vshrn_n_u32(bits, 16), vdup_n_u16(0x0040));
         h = vbsl_u16(vmovn_u32(isnan), nanh, h);
-        vst1_u16((uint16_t *)(void *)(dst + 2 * i), h);
+        /* byte store: dst may sit at any alignment; vst1_u16 would be UB there
+         * (UBSan on GB10 caught exactly this on an odd destination) */
+        vst1_u8(dst + 2 * i, vreinterpret_u8_u16(h));
     }
 #endif
     for (; i < nelem; i++) {
@@ -7437,10 +7442,20 @@ static size_t qk_token_tile(size_t cols) {
                 parsed <= INGOT_QK_TOKEN_TILE_MAX) override = (long)parsed;
         }
     }
-    if (override > 0) return (size_t)override;
-    size_t tile = INGOT_QK_TILE_BYTES / (cols * sizeof(float));
-    if (tile > INGOT_QK_TOKEN_TILE) tile = INGOT_QK_TOKEN_TILE;
-    if (tile < INGOT_QK_TOKEN_TILE_MIN) tile = INGOT_QK_TOKEN_TILE_MIN;
+    size_t tile;
+    if (override > 0) {
+        tile = (size_t)override;
+    } else {
+        tile = INGOT_QK_TILE_BYTES / (cols * sizeof(float));
+        if (tile > INGOT_QK_TOKEN_TILE) tile = INGOT_QK_TOKEN_TILE;
+        if (tile < INGOT_QK_TOKEN_TILE_MIN) tile = INGOT_QK_TOKEN_TILE_MIN;
+    }
+    /* The SMMLA worker indexes interleaved token PAIRS as
+     * (token_begin + t) / 2, which is only right when every tile starts on
+     * an even token. The derived tile can be odd (cols=11008 gives 95), and
+     * so can the env override: round down to even, floor 2. */
+    tile &= ~(size_t)1;
+    if (tile < 2) tile = 2;
     return tile;
 }
 
@@ -8929,13 +8944,15 @@ static void dense_rows(size_t begin, size_t end, void *user) {
                 for (; c + 8 <= cols; c += 8) {
                     float32x4_t wlo, whi;
                     if (f16) {
-                        const float16x8_t h = vld1q_f16(
-                            (const float16_t *)(const void *)(wrow + 2 * c));
+                        /* byte load: wrow follows the file layout and owes
+                         * no 2-byte alignment (same fix as the dtype.c lanes) */
+                        const float16x8_t h = vreinterpretq_f16_u8(
+                            vld1q_u8(wrow + 2 * c));
                         wlo = vcvt_f32_f16(vget_low_f16(h));
                         whi = vcvt_f32_f16(vget_high_f16(h));
                     } else {
-                        const uint16x8_t h = vld1q_u16(
-                            (const uint16_t *)(const void *)(wrow + 2 * c));
+                        const uint16x8_t h = vreinterpretq_u16_u8(
+                            vld1q_u8(wrow + 2 * c));
                         wlo = vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(h), 16));
                         whi = vreinterpretq_f32_u32(vshll_n_u16(vget_high_u16(h), 16));
                     }
@@ -8967,13 +8984,15 @@ static void dense_rows(size_t begin, size_t end, void *user) {
                 for (; c + 8 <= cols; c += 8) {
                     float32x4_t wlo, whi;
                     if (f16) {
-                        const float16x8_t h = vld1q_f16(
-                            (const float16_t *)(const void *)(wrow + 2 * c));
+                        /* byte load: wrow follows the file layout and owes
+                         * no 2-byte alignment (same fix as the dtype.c lanes) */
+                        const float16x8_t h = vreinterpretq_f16_u8(
+                            vld1q_u8(wrow + 2 * c));
                         wlo = vcvt_f32_f16(vget_low_f16(h));
                         whi = vcvt_f32_f16(vget_high_f16(h));
                     } else {
-                        const uint16x8_t h = vld1q_u16(
-                            (const uint16_t *)(const void *)(wrow + 2 * c));
+                        const uint16x8_t h = vreinterpretq_u16_u8(
+                            vld1q_u8(wrow + 2 * c));
                         wlo = vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(h), 16));
                         whi = vreinterpretq_f32_u32(vshll_n_u16(vget_high_u16(h), 16));
                     }
