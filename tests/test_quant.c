@@ -11,6 +11,8 @@
  *  - the tolerance is chosen by asking ingot_matmat_is_exact(), never guessed.
  *
  * SPDX-License-Identifier: MIT */
+#define _POSIX_C_SOURCE 200809L /* setenv/unsetenv under -std=c11 on glibc */
+#define _DARWIN_C_SOURCE        /* macOS: keep the full namespace alongside it */
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
