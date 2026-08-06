@@ -2372,6 +2372,191 @@ int ingot_q6_k_dequant(const void *weights, size_t rows, size_t cols,
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 #define INGOT_Q8_0_K 32
+
+/* ── Q4_0 ─────────────────────────────────────────────────────────────────────
+ * 32 weights in 18 bytes: { half d; uint8 qs[16] }. Element order is
+ * SPLIT-HALF, not interleaved — qs[i] & 0x0f is element i, qs[i] >> 4 is
+ * element i + 16 — and the stored nibble is biased by 8, so the value is
+ * (nibble - 8) * d.
+ *
+ * The SIMD shape here is qwen-tts's (load 16 bytes, split the nibbles, widen,
+ * FMA against several accumulators so the chain is not latency-bound), but NOT
+ * its element order: qwen-tts exports its own checkpoints with lo/hi
+ * interleaved and zips them back together with vzipq_s16. ggml does not, and
+ * copying that zip would have produced a kernel that runs, matches nothing,
+ * and is wrong in the same silent way the Q6_K layout trap was. The ggml order
+ * is the friendlier one anyway: low nibbles map contiguously onto x[0..15] and
+ * high nibbles onto x[16..31], so no shuffle is needed at all.
+ *
+ * Q4_0 mattered enough to write because it is what Google's Gemma 4 QAT
+ * checkpoints ship as — a model that would otherwise have run on the
+ * decode-a-row-then-dot generic path. */
+#define INGOT_Q4_0_K     32
+#define INGOT_Q4_0_BYTES 18
+
+static void q4_0_dequant_block(const unsigned char *block, float *output) {
+    const float d = f16_to_f32(read_u16(block));
+    const unsigned char *q = block + 2;
+    for (int i = 0; i < 16; i++) {
+        output[i]      = d * (float)((int)(q[i] & 0x0f) - 8);
+        output[i + 16] = d * (float)((int)(q[i] >> 4)   - 8);
+    }
+}
+
+#if defined(INGOT_HAVE_Q4_K_NEON)
+static float q4_0_dot_block_neon(const unsigned char *block, const float *x) {
+    const float d = f16_to_f32(read_u16(block));
+    const uint8x16_t raw = vld1q_u8(block + 2);
+    const uint8x8_t  eight = vdup_n_u8(8);
+
+    /* (nibble - 8) via an unsigned widening subtract, then reinterpreted: the
+     * result 0..15 minus 8 wraps to the right two's-complement int16. */
+    const uint8x16_t lo = vandq_u8(raw, vdupq_n_u8(0x0f));
+    const uint8x16_t hi = vshrq_n_u8(raw, 4);
+    const int16x8_t l0 = vreinterpretq_s16_u16(vsubl_u8(vget_low_u8(lo),  eight));
+    const int16x8_t l1 = vreinterpretq_s16_u16(vsubl_u8(vget_high_u8(lo), eight));
+    const int16x8_t h0 = vreinterpretq_s16_u16(vsubl_u8(vget_low_u8(hi),  eight));
+    const int16x8_t h1 = vreinterpretq_s16_u16(vsubl_u8(vget_high_u8(hi), eight));
+
+    float32x4_t a0 = vdupq_n_f32(0.0f), a1 = vdupq_n_f32(0.0f);
+    float32x4_t a2 = vdupq_n_f32(0.0f), a3 = vdupq_n_f32(0.0f);
+
+#define Q40_FMA(acc, v, half, off)                                             \
+    acc = vfmaq_f32(acc, vcvtq_f32_s32(vmovl_s16(vget_##half##_s16(v))),       \
+                    vld1q_f32(x + (off)))
+    Q40_FMA(a0, l0, low,   0);  Q40_FMA(a1, l0, high,  4);
+    Q40_FMA(a2, l1, low,   8);  Q40_FMA(a3, l1, high, 12);
+    Q40_FMA(a0, h0, low,  16);  Q40_FMA(a1, h0, high, 20);
+    Q40_FMA(a2, h1, low,  24);  Q40_FMA(a3, h1, high, 28);
+#undef Q40_FMA
+
+    /* One scale multiply per block instead of 32: every element in a Q4_0
+     * block shares d. */
+    return d * vaddvq_f32(vaddq_f32(vaddq_f32(a0, a1), vaddq_f32(a2, a3)));
+}
+
+static int ingot_q4_0_matvec_neon(const void *weights, size_t rows, size_t cols,
+                                  const float *input, float *output) {
+    const size_t blocks = cols / INGOT_Q4_0_K;
+    const size_t row_bytes = blocks * INGOT_Q4_0_BYTES;
+    const unsigned char *source = (const unsigned char *)weights;
+    for (size_t row = 0; row < rows; row++) {
+        const unsigned char *row_data = source + row * row_bytes;
+        float sum = 0.0f;
+        for (size_t b = 0; b < blocks; b++)
+            sum += q4_0_dot_block_neon(row_data + b * INGOT_Q4_0_BYTES,
+                                       input + b * INGOT_Q4_0_K);
+        output[row] = sum;
+    }
+    return 0;
+}
+#endif
+
+#if defined(INGOT_HAVE_Q4_K_AVX2)
+static float q4_0_dot_block_avx2(const unsigned char *block, const float *x) {
+    const float d = f16_to_f32(read_u16(block));
+    const __m128i raw = _mm_loadu_si128((const __m128i *)(block + 2));
+    const __m128i lo  = _mm_and_si128(raw, _mm_set1_epi8(0x0f));
+    const __m128i hi  = _mm_and_si128(_mm_srli_epi16(raw, 4), _mm_set1_epi8(0x0f));
+    const __m256i bias = _mm256_set1_epi32(8);
+
+    __m256 acc0 = _mm256_setzero_ps(), acc1 = _mm256_setzero_ps();
+
+#define Q40_AVX(acc, src, sel, off)                                            \
+    do {                                                                       \
+        const __m256i w_ = _mm256_sub_epi32(                                   \
+            _mm256_cvtepu8_epi32(_mm_srli_si128(src, sel)), bias);             \
+        acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(w_),                          \
+                              _mm256_loadu_ps(x + (off)), acc);                \
+    } while (0)
+    Q40_AVX(acc0, lo, 0,  0);  Q40_AVX(acc1, lo, 8,  8);
+    Q40_AVX(acc0, hi, 0, 16);  Q40_AVX(acc1, hi, 8, 24);
+#undef Q40_AVX
+
+    const __m256 sum = _mm256_add_ps(acc0, acc1);
+    __m128 v = _mm_add_ps(_mm256_castps256_ps128(sum), _mm256_extractf128_ps(sum, 1));
+    v = _mm_hadd_ps(v, v);
+    v = _mm_hadd_ps(v, v);
+    return d * _mm_cvtss_f32(v);
+}
+
+static int ingot_q4_0_matvec_avx2(const void *weights, size_t rows, size_t cols,
+                                  const float *input, float *output) {
+    const size_t blocks = cols / INGOT_Q4_0_K;
+    const size_t row_bytes = blocks * INGOT_Q4_0_BYTES;
+    const unsigned char *source = (const unsigned char *)weights;
+    for (size_t row = 0; row < rows; row++) {
+        const unsigned char *row_data = source + row * row_bytes;
+        float sum = 0.0f;
+        for (size_t b = 0; b < blocks; b++)
+            sum += q4_0_dot_block_avx2(row_data + b * INGOT_Q4_0_BYTES,
+                                       input + b * INGOT_Q4_0_K);
+        output[row] = sum;
+    }
+    return 0;
+}
+#endif
+
+static int q4_0_args_ok(const void *w, const float *in, const float *out,
+                        size_t rows, size_t cols) {
+    if (w == NULL || out == NULL || rows == 0 || cols == 0) return 0;
+    if (cols % INGOT_Q4_0_K != 0) return 0;
+    if (in == NULL) return 0;
+    const size_t blocks = cols / INGOT_Q4_0_K;
+    if (blocks > SIZE_MAX / INGOT_Q4_0_BYTES) return 0;
+    if (rows > SIZE_MAX / (blocks * INGOT_Q4_0_BYTES)) return 0;
+    return 1;
+}
+
+static int ingot_q4_0_matvec_scalar(const void *weights, size_t rows, size_t cols,
+                                    const float *input, float *output) {
+    const size_t blocks = cols / INGOT_Q4_0_K;
+    const size_t row_bytes = blocks * INGOT_Q4_0_BYTES;
+    const unsigned char *source = (const unsigned char *)weights;
+    float values[INGOT_Q4_0_K];
+    for (size_t row = 0; row < rows; row++) {
+        const unsigned char *row_data = source + row * row_bytes;
+        float sum = 0.0f;
+        for (size_t b = 0; b < blocks; b++) {
+            q4_0_dequant_block(row_data + b * INGOT_Q4_0_BYTES, values);
+            const float *x = input + b * INGOT_Q4_0_K;
+            for (int i = 0; i < INGOT_Q4_0_K; i++) sum += values[i] * x[i];
+        }
+        output[row] = sum;
+    }
+    return 0;
+}
+
+int ingot_q4_0_matvec(const void *weights, size_t rows, size_t cols,
+                      const float *input, float *output) {
+    if (!q4_0_args_ok(weights, input, output, rows, cols)) return -1;
+#if defined(INGOT_HAVE_Q4_K_NEON)
+    if (ingot_cpu().neon)
+        return ingot_q4_0_matvec_neon(weights, rows, cols, input, output);
+#endif
+#if defined(INGOT_HAVE_Q4_K_AVX2)
+    if (ingot_cpu().avx2)
+        return ingot_q4_0_matvec_avx2(weights, rows, cols, input, output);
+#endif
+    return ingot_q4_0_matvec_scalar(weights, rows, cols, input, output);
+}
+
+int ingot_q4_0_dequant(const void *weights, size_t rows, size_t cols,
+                       float *output) {
+    if (weights == NULL || output == NULL || rows == 0 || cols == 0) return -1;
+    if (cols % INGOT_Q4_0_K != 0) return -1;
+    const size_t blocks = cols / INGOT_Q4_0_K;
+    if (blocks > SIZE_MAX / INGOT_Q4_0_BYTES) return -1;
+    const size_t row_bytes = blocks * INGOT_Q4_0_BYTES;
+    if (rows > SIZE_MAX / row_bytes || rows > SIZE_MAX / cols) return -1;
+    const unsigned char *source = (const unsigned char *)weights;
+    for (size_t row = 0; row < rows; row++)
+        for (size_t b = 0; b < blocks; b++)
+            q4_0_dequant_block(source + row * row_bytes + b * INGOT_Q4_0_BYTES,
+                               output + row * cols + b * INGOT_Q4_0_K);
+    return 0;
+}
+
 #define INGOT_Q8_0_BYTES 34
 
 static void q8_0_dequant_block(const unsigned char *block, float *output) {
